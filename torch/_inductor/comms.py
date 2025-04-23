@@ -262,7 +262,7 @@ def node_summary(snode):
     snodes = snode.get_nodes()
     if len(snodes) == 1:
         detail = ""
-        if isinstance(snode.node, ir.ExternKernelOut):
+        if isinstance(snode.node, ir.ExternKernelOut, ir._CollectiveKernel):
             detail = f" ({snode.node.python_kernel_name})"
         out_tensor_info = ""
         layout = snode.node.get_output_spec()
@@ -313,7 +313,6 @@ def reorder_compute_and_comm_for_overlap(
     snodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
     order = snodes
-
     for p in config.reorder_for_compute_comm_overlap_passes:
         if isinstance(p, str) and p in globals():
             p = globals()[p]  # it is a builtin pass
