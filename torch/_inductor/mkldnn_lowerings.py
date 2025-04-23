@@ -29,6 +29,98 @@ from .utils import use_aten_gemm_kernels, use_cpp_gemm_template, use_max_autotun
 from .virtualized import ops, V
 
 
+def create_int8_compensation(
+    x_scale,
+    x_zp,
+    w_scale,
+    packed_weight,
+    W_tensor,
+):
+    use_int8_fast_epilogue_path = False
+    weight_compens = None
+    x_w_scale = None
+    if all(
+        isinstance(item, ir.TensorBox) and item.get_name() in V.graph.constants
+        for item in [x_scale, x_zp, w_scale]
+    ):
+        use_int8_fast_epilogue_path = True
+        x_w_scale_tensor = (
+            V.graph.constants[x_scale.get_name()]
+            * V.graph.constants[w_scale.get_name()]
+        )
+        x_w_scale = V.graph.add_tensor_constant(
+            x_w_scale_tensor,
+            name=packed_weight.get_name() + "_x_w_compens",
+        )
+        weight_compens_tensor = torch.sum(W_tensor.to(torch.float), dim=0)
+        x_zp_tensor = V.graph.constants[x_zp.get_name()]
+        weight_compens_tensor = weight_compens_tensor * x_w_scale_tensor * x_zp_tensor
+        weight_compens = V.graph.add_tensor_constant(
+            weight_compens_tensor,
+            name=packed_weight.get_name() + "_BMatrixCompens",
+        )
+    else:
+        weight_compens_tensor = torch.sum(W_tensor.to(torch.float), dim=0)
+        weight_compens = V.graph.add_tensor_constant(
+            weight_compens_tensor,
+            name=packed_weight.get_name() + "_BMatrixCompens",
+        )
+    return (
+        use_int8_fast_epilogue_path,
+        weight_compens,
+        x_w_scale,
+    )
+
+
+def codegen_int8_gemm_template_compensation(
+    use_int8_fast_epilogue_path,
+    input,
+    _x_w_scale,
+    _x_scale,
+    _w_scale,
+    _weight_compo,
+    _x_zp,
+):
+    if use_int8_fast_epilogue_path:
+        temp = ops.sub(
+            ops.mul(
+                input,
+                _x_w_scale,
+            ),
+            _weight_compo,
+        )
+    else:
+        temp = ops.mul(
+            ops.mul(
+                input,
+                _x_scale,
+            ),
+            _w_scale,
+        )
+        # NOTE: We will apply compensation even if the x_zp is 0 for int8 quantization.
+        # That's because when torch.compile is invoked for dynamic quantization,
+        # x might coincidentally have such values that x_zp might be zero despite
+        # asymmetric quantization.
+        # Besides, if x_zp is dummy for int8 x, or if x is statically quantized,
+        # we'd still perform that redundant compute to avoid making the code messy
+        # because we discovered that redundant computation of compensation did not
+        # lead to performance degradation with the input shapes tested.
+        temp = ops.sub(
+            temp,
+            ops.mul(
+                ops.mul(
+                    ops.mul(
+                        _x_scale,
+                        _w_scale,
+                    ),
+                    _x_zp,
+                ),
+                _weight_compo,
+            ),
+        )
+    return temp
+
+
 def grouped_gemm_lowering(
     x: TensorBox,
     w: list[TensorBox],
@@ -656,10 +748,17 @@ def register_onednn_fusion_ops():
                     )
                 ) and use_cpp_gemm_template(layout, x, packed_weight):
                     W_tensor = V.graph.constants[packed_weight.get_name()].to_dense()
-                    weight_compens_tensor = torch.sum(W_tensor.to(torch.float), dim=0)
-                    weight_compens = V.graph.add_tensor_constant(
-                        weight_compens_tensor,
-                        name=packed_weight.get_name() + "_BMatrixCompens",
+
+                    (
+                        use_int8_fast_epilogue_path,
+                        weight_compens,
+                        x_w_scale,
+                    ) = create_int8_compensation(
+                        x_scale,
+                        x_zp,
+                        w_scale,
+                        packed_weight,
+                        W_tensor,
                     )
 
                     def epilogue_creator(input_buffer):
@@ -672,6 +771,11 @@ def register_onednn_fusion_ops():
                         ]
                         input_loader = input_buffer.make_loader()
                         weight_compens_loader = weight_compens.make_loader()
+                        x_w_scale_loader = (
+                            None
+                            if not use_int8_fast_epilogue_path
+                            else x_w_scale.make_loader()
+                        )
                         x_scale_loader = x_scale.make_loader()
                         w_scale_loader = w_scale.make_loader()
                         x_zp_loader = x_zp.make_loader()
@@ -687,40 +791,33 @@ def register_onednn_fusion_ops():
                             # cvt to FP32 before doing compensation
                             input = ops.to_dtype(input, torch.float32)
                             weight_compens_index = (index[-1],)
-                            _x_scale = x_scale_loader(())
-                            _x_zp = x_zp_loader(())
-                            _w_scale = w_scale_loader(weight_compens_index)
-                            _weight_compo = weight_compens_loader(weight_compens_index)
-
-                            # Step 1: Compute s8s8->s32 or u8s8->s32 GEMM & then apply compensation
-
-                            temp = ops.mul(
-                                ops.mul(
-                                    input,
-                                    _x_scale,
-                                ),
-                                _w_scale,
+                            _x_scale = (
+                                None
+                                if use_int8_fast_epilogue_path
+                                else x_scale_loader(())
                             )
-                            # NOTE: We will apply compensation even if the x_zp is 0 for int8 quantization.
-                            # That's because when torch.compile is invoked for dynamic quantization,
-                            # x might coincidentally have such values that x_zp might be zero despite
-                            # asymmetric quantization.
-                            # Besides, if x_zp is dummy for int8 x, or if x is statically quantized,
-                            # we'd still perform that redundant compute to avoid making the code messy
-                            # because we discovered that redundant computation of compensation did not
-                            # lead to performance degradation with the input shapes tested.
-                            temp = ops.sub(
-                                temp,
-                                ops.mul(
-                                    ops.mul(
-                                        ops.mul(
-                                            _x_scale,
-                                            _w_scale,
-                                        ),
-                                        _x_zp,
-                                    ),
-                                    _weight_compo,
-                                ),
+                            _x_zp = (
+                                None if use_int8_fast_epilogue_path else x_zp_loader(())
+                            )
+                            _w_scale = (
+                                None
+                                if use_int8_fast_epilogue_path
+                                else w_scale_loader(weight_compens_index)
+                            )
+                            _weight_compo = weight_compens_loader(weight_compens_index)
+                            # Step 1: Compute s8s8->s32 or u8s8->s32 GEMM & then apply compensation
+                            _x_w_scale = None
+                            if use_int8_fast_epilogue_path:
+                                assert x_w_scale_loader is not None
+                                _x_w_scale = x_w_scale_loader(weight_compens_index)
+                            temp = codegen_int8_gemm_template_compensation(
+                                use_int8_fast_epilogue_path,
+                                input,
+                                _x_w_scale,
+                                _x_scale,
+                                _w_scale,
+                                _weight_compo,
+                                _x_zp,
                             )
                             # Step 2: add Bias if applicable
                             if bias is not None:
@@ -981,10 +1078,16 @@ def register_onednn_fusion_ops():
                 ):
                     W_tensor = V.graph.constants[packed_weight.get_name()]
                     W_tensor = W_tensor.to_dense()
-                    weight_compens_tensor = torch.sum(W_tensor.to(torch.float), dim=0)
-                    weight_compens = V.graph.add_tensor_constant(
-                        weight_compens_tensor,
-                        name=packed_weight.get_name() + "_BMatrixCompens",
+                    (
+                        use_int8_fast_epilogue_path,
+                        weight_compens,
+                        x_w_scale,
+                    ) = create_int8_compensation(
+                        x_scale,
+                        x_zp,
+                        w_scale,
+                        packed_weight,
+                        W_tensor,
                     )
 
                     def epilogue_creator(input_buffer):
@@ -999,6 +1102,11 @@ def register_onednn_fusion_ops():
                         input_loader = input_buffer.make_loader()
                         x2_loader = x2.make_loader()
                         weight_compens_loader = weight_compens.make_loader()
+                        x_w_scale_loader = (
+                            None
+                            if not use_int8_fast_epilogue_path
+                            else x_w_scale.make_loader()
+                        )
                         x_scale_loader = x_scale.make_loader()
                         w_scale_loader = w_scale.make_loader()
                         x_zp_loader = x_zp.make_loader()
@@ -1011,39 +1119,39 @@ def register_onednn_fusion_ops():
                             nonlocal bias
                             input = input_loader(index)
                             _x2 = x2_loader(index)
-                            _x_scale = x_scale_loader(())
-                            _x_zp = x_zp_loader(())
+                            _x_scale = (
+                                None
+                                if use_int8_fast_epilogue_path
+                                else x_scale_loader(())
+                            )
+                            _x_zp = (
+                                None if use_int8_fast_epilogue_path else x_zp_loader(())
+                            )
 
                             # MicroKernel Output is with int32
                             # cvt to FP32 before doing compensation
                             input = ops.to_dtype(input, torch.float32)
                             weight_compens_index = (index[-1],)
-                            _w_scale = w_scale_loader(weight_compens_index)
-                            _weight_compens = weight_compens_loader(
-                                weight_compens_index
+                            _w_scale = (
+                                None
+                                if use_int8_fast_epilogue_path
+                                else w_scale_loader(weight_compens_index)
                             )
+                            _weight_compo = weight_compens_loader(weight_compens_index)
                             # Step 1: Doing compensation to cvt fp32
-                            temp = ops.mul(
-                                ops.mul(
-                                    input,
-                                    _x_scale,
-                                ),
+                            _x_w_scale = None
+                            if use_int8_fast_epilogue_path:
+                                assert x_w_scale_loader is not None
+                                _x_w_scale = x_w_scale_loader(weight_compens_index)
+                            temp = codegen_int8_gemm_template_compensation(
+                                use_int8_fast_epilogue_path,
+                                input,
+                                _x_w_scale,
+                                _x_scale,
                                 _w_scale,
+                                _weight_compo,
+                                _x_zp,
                             )
-                            temp = ops.sub(
-                                temp,
-                                ops.mul(
-                                    ops.mul(
-                                        ops.mul(
-                                            _x_scale,
-                                            _w_scale,
-                                        ),
-                                        _x_zp,
-                                    ),
-                                    _weight_compens,
-                                ),
-                            )
-
                             # Step 2: add Bias if applicable
                             if bias is not None:
                                 _bias = bias_loader(weight_compens_index)
