@@ -4,6 +4,7 @@ from typing import Any, Callable, Literal, Optional, TYPE_CHECKING, Union
 
 import torch
 import torch._inductor.custom_graph_pass
+import torch.utils._ordered_set
 from torch._environment import is_fbcode
 from torch.utils._config_module import Config, get_tristate_env, install_config_module
 
@@ -334,15 +335,27 @@ reorder_for_compute_comm_overlap_passes: list[
     Union[
         str,
         Callable[
-            [list["torch._inductor.scheduler.BaseSchedulerNode"]],
+            [
+                # Input schedule nodes
+                list["torch._inductor.scheduler.BaseSchedulerNode"],
+                # Graph Inputs
+                torch.utils._ordered_set.OrderedSet[str],
+                # Graph Outputs
+                torch.utils._ordered_set.OrderedSet[str],
+            ],
             list["torch._inductor.scheduler.BaseSchedulerNode"],
         ],
     ]
 ] = [
-    "reorder_compute_for_overlap",
-    "sink_waits",
+    # "sink_waits",
+    # "reorder_comms_preserving_peak_memory",
     "raise_comms",
+    "sink_waits",
+    "reorder_compute_for_overlap",
 ]
+
+# Maximum number of positions to advance a given collective, unlimited by default
+reorder_prefetch_limit: Optional[int] = None
 
 # enable operator reordering for peak memory optimization
 reorder_for_peak_memory = True
